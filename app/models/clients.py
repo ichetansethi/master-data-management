@@ -12,7 +12,7 @@ class ClientStatus(str, enum.Enum):
     ACTIVE = "active"
     INACTIVE = "inactive"
 
-class Client(BaseApp):
+class Clients(BaseApp):
 
     __tablename__ = "clients"
 
