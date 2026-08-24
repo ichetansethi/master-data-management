@@ -1,0 +1,28 @@
+services:
+  leads-db:
+    image: postgres:16
+    container_name: call-reporting-platform-leads-db
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - leads_db_data:/var/lib/postgresql/data
+
+  app-config-db:
+    image: postgres:16
+    container_name: call-reporting-platform-app-config-db
+    ports:
+      - "5435:5432"
+    environment:
+      - POSTGRES_USER=${APP_CONFIG_DB_USER}
+      - POSTGRES_PASSWORD=${APP_CONFIG_DB_PASS}
+      - POSTGRES_DB=${APP_CONFIG_DB_NAME}
+    volumes:
+      - app_config_db_data:/var/lib/postgresql/data
+
+volumes:
+  leads_db_data:
+  app_config_db_data:
