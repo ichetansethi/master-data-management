@@ -5,6 +5,7 @@ from sqlalchemy import pool
 from app.models.clients import Clients
 from app.models.roles import Roles
 from app.models.users import Users
+from app.models.connector import Connector
 from alembic import context
 
 from app.database_app import BaseApp
