@@ -8,6 +8,7 @@ from typing import AsyncGenerator
 from app.database_app import AsyncSessionLocal_app
 from app.security import decode_access_token
 from app.models.users import Users
+from app.models.roles import Roles
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
@@ -53,3 +54,26 @@ async def get_current_user(
         )
 
     return user
+
+def require_role(allowed_roles: list[str]):
+    async def role_checker(
+        current_user: Users = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db),
+    ):
+        result = await db.execute(select(Roles).where(Roles.id == current_user.role_id))
+        role = result.scalar_one_or_none()
+
+        if role is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User has no valid role assigned",
+            )
+
+        if role.name not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+            )
+
+        return current_user
+    return role_checker
