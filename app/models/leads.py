@@ -21,7 +21,7 @@ class LeadStatus(str, enum.Enum):
     REJECTED = "rejected"
 
 
-class Lead(Base):
+class Leads(Base):
 
     __tablename__ = "leads"
 
@@ -29,11 +29,11 @@ class Lead(Base):
     org_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     customer_id: Mapped[str] = mapped_column(String, nullable=False)
     phone_number: Mapped[str] = mapped_column(String, nullable=False)
-    source: Mapped[LeadSource] = mapped_column(Enum(LeadSource), nullable=False)
+    source: Mapped[LeadSource] = mapped_column(Enum(LeadSource, name="leadsource"), nullable=False)
     idempotency_key: Mapped[str | None] = mapped_column(String, nullable=True)
     dedup_hash: Mapped[str] = mapped_column(String, nullable=False)
     lead_attributes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    status: Mapped[LeadStatus] = mapped_column(Enum(LeadStatus), nullable=False, default=LeadStatus.PENDING)
+    status: Mapped[LeadStatus] = mapped_column(Enum(LeadStatus, name="leadstatus"), nullable=False, default=LeadStatus.PENDING)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 

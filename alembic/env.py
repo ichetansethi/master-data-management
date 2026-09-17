@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from app.database import Base
 from app.config import settings
-from app.models.leads import Lead
+from app.models.leads import Leads
 from app.models.lead_ingestion_batch import LeadIngestionBatch
 
 # this is the Alembic Config object, which provides
