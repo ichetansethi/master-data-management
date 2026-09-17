@@ -1,12 +1,13 @@
-import uuid
 import enum
 from datetime import datetime
 
-from sqlalchemy import String, Enum, UniqueConstraint, Index, func
+from sqlalchemy import BigInteger, CheckConstraint, String, Enum, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, TIMESTAMP
+from sqlalchemy.dialects.postgresql import TIMESTAMP
+from sqlalchemy import Identity
 
 from app.database_app import BaseApp
+from app.org_id import ORG_ID_MAX, ORG_ID_MIN
 
 class ClientStatus(str, enum.Enum):
     ACTIVE = "active"
@@ -16,12 +17,19 @@ class Clients(BaseApp):
 
     __tablename__ = "clients"
 
-    id: Mapped[uuid.UUID] = mapped_column(PG_UUID, primary_key=True, default=uuid.uuid4)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        Identity(start=ORG_ID_MIN, increment=1),
+        primary_key=True,
+    )
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     status: Mapped[ClientStatus] = mapped_column(Enum(ClientStatus), nullable=False, default=ClientStatus.ACTIVE)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
-__table_args__ = (
-    UniqueConstraint("id", "name", name="uix_id_name"),
-)
+    __table_args__ = (
+        CheckConstraint(
+            f"id BETWEEN {ORG_ID_MIN} AND {ORG_ID_MAX}",
+            name="ck_clients_id_10_digits",
+        ),
+    )
