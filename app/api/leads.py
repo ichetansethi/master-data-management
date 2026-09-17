@@ -1,19 +1,23 @@
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, status
 import csv
-
 from app.models.users import Users
 from app.dependencies import require_role
 from app.org_id import is_ten_digit_org_id
+from app.models.lead_ingestion_batch import LeadIngestionBatch, LeadIngestionBatchStatus
+from app.dependencies import get_leads_db
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.leads import LeadSource
 
 router = APIRouter()
-
 
 @router.post("/leads/upload")
 async def upload_leads(
     file: UploadFile = File(...),
     org_id: int | None = Form(None),
     current_user: Users = Depends(require_role(["ADMIN", "ORG_ADMIN"])),
+    leads_db: AsyncSession = Depends(get_leads_db),
 ):
+
     if current_user.org_id is not None:
         # client-scoped user (ORG_ADMIN) — always use their own org, ignore any org_id passed in
         target_org_id = current_user.org_id
@@ -31,6 +35,17 @@ async def upload_leads(
             )
         target_org_id = org_id
 
+    batch = LeadIngestionBatch(
+    org_id=target_org_id,
+    connector_id=None,
+    status=LeadIngestionBatchStatus.PROCESSING,
+    source=LeadSource.CSV,
+    source_ref=file.filename,
+    )
+    leads_db.add(batch)
+    await leads_db.commit()
+    await leads_db.refresh(batch)
+
     rows = []
 
     try:
@@ -43,4 +58,9 @@ async def upload_leads(
     if not rows:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No data found in the uploaded file.")
 
-    return {"total_rows": len(rows), "rows": rows, "target_org_id": target_org_id}
+    return {
+        "batch_id": str(batch.id),
+        "status": batch.status,
+        "target_org_id": target_org_id,
+        "total_rows_parsed": len(rows),
+    }

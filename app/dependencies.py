@@ -9,6 +9,7 @@ from app.database_app import AsyncSessionLocal_app
 from app.security import decode_access_token
 from app.models.users import Users
 from app.models.roles import Roles
+from app.database import AsyncSessionLocal
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
@@ -16,6 +17,9 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal_app() as session:
         yield session
 
+async def get_leads_db() -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSessionLocal() as session:
+        yield session
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
