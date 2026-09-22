@@ -3,11 +3,13 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import jwt
+import uuid
 from typing import AsyncGenerator
-
+from fastapi import Header
 from app.database_app import AsyncSessionLocal_app
 from app.security import decode_access_token
 from app.models.users import Users
+from app.models.connector import Connector
 from app.models.roles import Roles
 from app.database import AsyncSessionLocal
 
@@ -81,3 +83,26 @@ def require_role(allowed_roles: list[str]):
 
         return current_user
     return role_checker
+
+async def get_current_connector(
+    connector_id: uuid.UUID,
+    x_api_key: str = Header(...),
+    x_api_secret: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+) -> Connector:
+    result = await db.execute(select(Connector).where(Connector.id == connector_id))
+    connector = result.scalar_one_or_none()
+
+    if connector is None or not connector.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Connector not found or inactive",
+        )
+
+    if connector.api_key != x_api_key or connector.api_secret != x_api_secret:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key or secret",
+        )
+
+    return connector
