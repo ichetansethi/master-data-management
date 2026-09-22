@@ -7,6 +7,7 @@ from app.api.ingest import router as ingest_router
 app = FastAPI(title="Call Reporting Platform")
 app.include_router(login_router)
 app.include_router(leads_router)
+app.include_router(ingest_router)
 
 @app.get("/health")
 async def health_check():
