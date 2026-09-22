@@ -34,8 +34,8 @@ class Leads(Base):
     dedup_hash: Mapped[str] = mapped_column(String, nullable=False)
     lead_attributes: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[LeadStatus] = mapped_column(Enum(LeadStatus, name="leadstatus"), nullable=False, default=LeadStatus.PENDING)
-    created_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
         UniqueConstraint("org_id", "idempotency_key", name="uix_org_id_idempotency_key"),

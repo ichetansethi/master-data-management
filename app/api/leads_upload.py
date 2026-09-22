@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import csv
 
 from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, status
@@ -59,7 +59,7 @@ async def upload_leads(
     except UnicodeDecodeError:
         batch.status = LeadIngestionBatchStatus.FAILED
         batch.error_messages = [{"reason": "File is not valid UTF-8 text."}]
-        batch.completed_at = datetime.now()
+        batch.completed_at = datetime.now(timezone.utc)
         await leads_db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -70,7 +70,7 @@ async def upload_leads(
         batch.status = LeadIngestionBatchStatus.FAILED
         batch.total_leads = 0
         batch.error_messages = [{"reason": "No data found in the uploaded file."}]
-        batch.completed_at = datetime.now()
+        batch.completed_at = datetime.now(timezone.utc)
         await leads_db.commit()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -150,7 +150,7 @@ async def upload_leads(
     batch.success_leads = len(success_rows)
     batch.failed_leads = len(error_log)
     batch.error_messages = error_log
-    batch.completed_at = datetime.now()
+    batch.completed_at = datetime.now(timezone.utc)
     if error_log:
         batch.status = LeadIngestionBatchStatus.COMPLETED_WITH_ERRORS
     else:

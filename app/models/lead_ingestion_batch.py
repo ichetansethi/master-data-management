@@ -32,8 +32,8 @@ class LeadIngestionBatch(Base):
     success_leads: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     failed_leads: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_messages: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
-    created_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False, server_default=func.now())
-    completed_at: Mapped[datetime|None] = mapped_column(TIMESTAMP, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    completed_at: Mapped[datetime|None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
