@@ -8,7 +8,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
-from app.config import settings
 from app.dependencies import get_current_connector, get_leads_db
 from app.models.connector import Connector
 from app.models.lead_ingestion_batch import LeadIngestionBatch, LeadIngestionBatchStatus
@@ -26,16 +25,45 @@ class S3IngestRequest(BaseModel):
     object_key: str
 
 
-def _fetch_s3_object(object_key: str) -> bytes:
+def _resolve_connection_config(connection_config: dict | None) -> dict:
+    """Validate a connector's connection_config has what's needed to reach
+    its bucket, and return it. Raises ValueError (-> 400) if misconfigured."""
+    connection_config = connection_config or {}
+    missing = [
+        field
+        for field in ("bucket", "access_key", "secret_key")
+        if not connection_config.get(field)
+    ]
+    if missing:
+        raise ValueError(
+            "Connector connection_config is missing required field(s): "
+            + ", ".join(missing)
+        )
+    return connection_config
+
+
+def _resolve_object_key(connection_config: dict, object_key: str) -> str:
+    prefix = connection_config.get("prefix") or ""
+    if not prefix:
+        return object_key
+    return prefix.rstrip("/") + "/" + object_key.lstrip("/")
+
+
+def _fetch_s3_object(connection_config: dict, object_key: str) -> bytes:
     """Blocking boto3 download - always call via run_in_threadpool from an
-    async endpoint."""
-    client = get_s3_client()
+    async endpoint. Uses the connector's own bucket + credentials, since each
+    connector owns its own bucket (connection_config), not a shared one."""
+    client = get_s3_client(
+        access_key=connection_config["access_key"],
+        secret_key=connection_config["secret_key"],
+    )
+    full_key = _resolve_object_key(connection_config, object_key)
     try:
-        response = client.get_object(Bucket=settings.minio_bucket_name, Key=object_key)
+        response = client.get_object(Bucket=connection_config["bucket"], Key=full_key)
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
         if error_code in ("NoSuchKey", "404"):
-            raise FileNotFoundError(object_key) from exc
+            raise FileNotFoundError(full_key) from exc
         raise
     return response["Body"].read()
 
@@ -204,11 +232,21 @@ async def ingest_leads_from_s3(
         )
 
     try:
-        raw_bytes = await run_in_threadpool(_fetch_s3_object, body.object_key)
+        connection_config = _resolve_connection_config(connector.connection_config)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    full_key = _resolve_object_key(connection_config, body.object_key)
+
+    try:
+        raw_bytes = await run_in_threadpool(_fetch_s3_object, connection_config, body.object_key)
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Object '{body.object_key}' not found in bucket '{settings.minio_bucket_name}'.",
+            detail=f"Object '{full_key}' not found in bucket '{connection_config['bucket']}'.",
         )
 
     batch = LeadIngestionBatch(
@@ -216,7 +254,7 @@ async def ingest_leads_from_s3(
         connector_id=connector.id,
         status=LeadIngestionBatchStatus.PROCESSING,
         source=LeadSource.S3,
-        source_ref=body.object_key,
+        source_ref=full_key,
     )
     leads_db.add(batch)
     await leads_db.commit()
@@ -336,6 +374,8 @@ async def ingest_leads_from_s3(
         "status": batch.status,
         "target_org_id": target_org_id,
         "object_key": body.object_key,
+        "bucket": connection_config["bucket"],
+        "resolved_key": full_key,
         "total_rows_parsed": len(rows),
         "total_rows_success": len(success_rows),
         "total_rows_error": len(error_log),
