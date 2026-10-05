@@ -2,6 +2,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.leads import Leads
+import aioboto3
+
+R2_ENDPOINT_URL = "https://a12374b2a553b7aea70675086bfc3dc8.r2.cloudflarestorage.com"
 
 
 def _lead_payload(lead: Leads) -> dict:
@@ -60,3 +63,19 @@ async def flush_pending(
                     "reason": "Duplicate or constraint violation on insert",
                 }
             )
+
+async def list_pending_files(connector) -> list[str]:
+    config = connector.connection_config
+    prefix = config.get("prefix", "")
+    ingestion_prefix = f"{prefix}ingestion/"
+
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT_URL,
+        aws_access_key_id=config["access_key"],
+        aws_secret_access_key=config["secret_key"],
+    ) as s3:
+        response = await s3.list_objects_v2(Bucket=config["bucket"], Prefix=ingestion_prefix)
+        contents = response.get("Contents", [])
+        return [obj["Key"] for obj in contents if obj["Key"] != ingestion_prefix]
