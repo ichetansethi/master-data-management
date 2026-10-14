@@ -1,24 +1,23 @@
 import csv
-from datetime import datetime, timezone
 
 from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.concurrency import run_in_threadpool
 
 from app.dependencies import get_current_connector, get_leads_db
 from app.models.connector import Connector
-from app.models.lead_ingestion_batch import LeadIngestionBatch, LeadIngestionBatchStatus
-from app.models.leads import Leads, LeadSource, LeadStatus
-from app.utils.normalization import translate_payload, compute_dedup_hash
-from app.services.ingestion import flush_pending
+from app.models.leads import LeadSource
+from app.services.ingestion import (
+    TooManyLeads,
+    batch_summary,
+    complete_batch,
+    fail_batch,
+    open_batch,
+)
 from app.services.s3_client import get_s3_client
 
 router = APIRouter()
-
-BATCH_SIZE = 100
 
 
 class S3IngestRequest(BaseModel):
@@ -49,23 +48,38 @@ def _resolve_object_key(connection_config: dict, object_key: str) -> str:
     return prefix.rstrip("/") + "/" + object_key.lstrip("/")
 
 
-def _fetch_s3_object(connection_config: dict, object_key: str) -> bytes:
-    """Blocking boto3 download - always call via run_in_threadpool from an
-    async endpoint. Uses the connector's own bucket + credentials, since each
-    connector owns its own bucket (connection_config), not a shared one."""
-    client = get_s3_client(
+def _require_identity_mapping(connector: Connector) -> None:
+    mapped_targets = {
+        mapping.get("lead_attribute")
+        for mapping in (connector.field_mapping or [])
+    }
+    if "customer_id" not in mapped_targets or "phone_number" not in mapped_targets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Connector field_mapping must map both customer_id and phone_number.",
+        )
+
+
+async def _fetch_s3_object(connection_config: dict, object_key: str) -> bytes:
+    """Download one object with the connector's own bucket + credentials.
+    Each connector owns its own bucket (connection_config), not a shared one."""
+    full_key = _resolve_object_key(connection_config, object_key)
+    async with get_s3_client(
         access_key=connection_config["access_key"],
         secret_key=connection_config["secret_key"],
-    )
-    full_key = _resolve_object_key(connection_config, object_key)
-    try:
-        response = client.get_object(Bucket=connection_config["bucket"], Key=full_key)
-    except ClientError as exc:
-        error_code = exc.response.get("Error", {}).get("Code")
-        if error_code in ("NoSuchKey", "404"):
-            raise FileNotFoundError(full_key) from exc
-        raise
-    return response["Body"].read()
+        endpoint_url=connection_config.get("endpoint_url"),
+    ) as client:
+        try:
+            response = await client.get_object(
+                Bucket=connection_config["bucket"],
+                Key=full_key,
+            )
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code")
+            if error_code in ("NoSuchKey", "404"):
+                raise FileNotFoundError(full_key) from exc
+            raise
+        return await response["Body"].read()
 
 
 @router.post("/leads/ingest/{connector_id}")
@@ -74,15 +88,7 @@ async def ingest_leads(
     connector: Connector = Depends(get_current_connector),
     leads_db: AsyncSession = Depends(get_leads_db),
 ):
-    mapped_targets = {
-        mapping.get("lead_attribute")
-        for mapping in (connector.field_mapping or [])
-    }
-    if "customer_id" not in mapped_targets or "phone_number" not in mapped_targets:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connector field_mapping must map both customer_id and phone_number.",
-        )
+    _require_identity_mapping(connector)
 
     raw_leads = payload.get("data", [])
     if not isinstance(raw_leads, list):
@@ -91,128 +97,42 @@ async def ingest_leads(
             detail="payload.data must be a list of leads",
         )
 
-    batch = LeadIngestionBatch(
+    batch = await open_batch(
+        leads_db,
         org_id=connector.org_id,
         connector_id=connector.id,
-        status=LeadIngestionBatchStatus.PROCESSING,
         source=LeadSource.API,
-        source_ref=None,
     )
-    leads_db.add(batch)
-    await leads_db.commit()
-    await leads_db.refresh(batch)
-    batch_id = batch.id
 
     if not raw_leads:
-        batch.status = LeadIngestionBatchStatus.FAILED
-        batch.total_leads = 0
-        batch.error_messages = [{"reason": "No data found in the payload."}]
-        batch.completed_at = datetime.now(timezone.utc)
-        await leads_db.commit()
+        await fail_batch(leads_db, batch, "No data found in the payload.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No data found in the payload.",
         )
 
-    pending_leads: list[tuple[int, Leads]] = []
-    success_rows: list[dict] = []
-    error_log: list[dict] = []
-    seen_customer_ids: set[str] = set()
-    seen_hashes: set[str] = set()
-    target_org_id = connector.org_id
-
-    for i, raw_lead in enumerate(raw_leads, start=1):
-        if not isinstance(raw_lead, dict):
-            error_log.append({"row_number": i, "reason": "Lead payload must be an object"})
-            continue
-
-        try:
-            translated = translate_payload(raw_lead, connector.field_mapping)
-            customer_id = translated.get("customer_id")
-            phone_number = translated.get("phone_number")
-            if not customer_id or not phone_number:
-                raise ValueError("customer_id and phone_number are required")
-            dedup_hash = compute_dedup_hash(target_org_id, customer_id, phone_number)
-        except ValueError as exc:
-            error_log.append({"row_number": i, "reason": str(exc)})
-            continue
-
-        if customer_id in seen_customer_ids:
-            error_log.append({"row_number": i, "reason": "Duplicate customer_id in payload"})
-            continue
-
-        if dedup_hash in seen_hashes:
-            error_log.append({"row_number": i, "reason": "Duplicate found"})
-            continue
-
-        existing_hash = await leads_db.execute(
-            select(Leads).where(
-                Leads.org_id == target_org_id,
-                Leads.dedup_hash == dedup_hash,
-            )
+    try:
+        batch, success_rows, error_log = await complete_batch(
+            leads_db,
+            batch,
+            raw_leads,
+            connector.org_id,
+            LeadSource.API,
+            field_mapping=connector.field_mapping,
         )
-        if existing_hash.scalar_one_or_none():
-            error_log.append({"row_number": i, "reason": "Duplicate found"})
-            continue
-
-        existing_customer = await leads_db.execute(
-            select(Leads).where(
-                Leads.org_id == target_org_id,
-                Leads.customer_id == customer_id,
-            )
+    except TooManyLeads as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
         )
-        if existing_customer.scalar_one_or_none():
-            error_log.append({"row_number": i, "reason": "Duplicate customer_id"})
-            continue
 
-        lead = Leads(
-            org_id=target_org_id,
-            customer_id=customer_id,
-            phone_number=phone_number,
-            source=LeadSource.API,
-            dedup_hash=dedup_hash,
-            lead_attributes={
-                key: value
-                for key, value in translated.items()
-                if key not in ("customer_id", "phone_number")
-            },
-            status=LeadStatus.PENDING,
-        )
-        leads_db.add(lead)
-        pending_leads.append((i, lead))
-        seen_customer_ids.add(customer_id)
-        seen_hashes.add(dedup_hash)
-
-        if len(pending_leads) >= BATCH_SIZE:
-            await flush_pending(leads_db, pending_leads, success_rows, error_log)
-            pending_leads = []
-
-    await flush_pending(leads_db, pending_leads, success_rows, error_log)
-
-    batch = await leads_db.get(LeadIngestionBatch, batch_id)
-    batch.total_leads = len(raw_leads)
-    batch.success_leads = len(success_rows)
-    batch.failed_leads = len(error_log)
-    batch.error_messages = error_log
-    batch.completed_at = datetime.now(timezone.utc)
-    if error_log:
-        batch.status = LeadIngestionBatchStatus.COMPLETED_WITH_ERRORS
-    else:
-        batch.status = LeadIngestionBatchStatus.COMPLETED_SUCCESSFULLY
-
-    await leads_db.commit()
-    await leads_db.refresh(batch)
-
-    return {
-        "batch_id": str(batch.id),
-        "status": batch.status,
-        "target_org_id": target_org_id,
-        "total_rows_parsed": len(raw_leads),
-        "total_rows_success": len(success_rows),
-        "total_rows_error": len(error_log),
-        "error_log": error_log,
-        "success_rows": success_rows,
-    }
+    return batch_summary(
+        batch,
+        raw_leads,
+        success_rows,
+        error_log,
+        target_org_id=connector.org_id,
+    )
 
 
 @router.post("/leads/ingest/{connector_id}/s3")
@@ -221,15 +141,7 @@ async def ingest_leads_from_s3(
     connector: Connector = Depends(get_current_connector),
     leads_db: AsyncSession = Depends(get_leads_db),
 ):
-    mapped_targets = {
-        mapping.get("lead_attribute")
-        for mapping in (connector.field_mapping or [])
-    }
-    if "customer_id" not in mapped_targets or "phone_number" not in mapped_targets:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connector field_mapping must map both customer_id and phone_number.",
-        )
+    _require_identity_mapping(connector)
 
     try:
         connection_config = _resolve_connection_config(connector.connection_config)
@@ -242,143 +154,59 @@ async def ingest_leads_from_s3(
     full_key = _resolve_object_key(connection_config, body.object_key)
 
     try:
-        raw_bytes = await run_in_threadpool(_fetch_s3_object, connection_config, body.object_key)
+        raw_bytes = await _fetch_s3_object(connection_config, body.object_key)
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Object '{full_key}' not found in bucket '{connection_config['bucket']}'.",
         )
 
-    batch = LeadIngestionBatch(
+    batch = await open_batch(
+        leads_db,
         org_id=connector.org_id,
         connector_id=connector.id,
-        status=LeadIngestionBatchStatus.PROCESSING,
         source=LeadSource.S3,
         source_ref=full_key,
     )
-    leads_db.add(batch)
-    await leads_db.commit()
-    await leads_db.refresh(batch)
-    batch_id = batch.id
 
     try:
         rows = list(csv.DictReader(raw_bytes.decode("utf-8").splitlines()))
     except UnicodeDecodeError:
-        batch.status = LeadIngestionBatchStatus.FAILED
-        batch.error_messages = [{"reason": "Object is not valid UTF-8 CSV text."}]
-        batch.completed_at = datetime.now(timezone.utc)
-        await leads_db.commit()
+        await fail_batch(leads_db, batch, "Object is not valid UTF-8 CSV text.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Object is not valid UTF-8 CSV text.",
         )
 
     if not rows:
-        batch.status = LeadIngestionBatchStatus.FAILED
-        batch.total_leads = 0
-        batch.error_messages = [{"reason": "No data found in the object."}]
-        batch.completed_at = datetime.now(timezone.utc)
-        await leads_db.commit()
+        await fail_batch(leads_db, batch, "No data found in the object.")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No data found in the object.",
         )
 
-    pending_leads: list[tuple[int, Leads]] = []
-    success_rows: list[dict] = []
-    error_log: list[dict] = []
-    seen_customer_ids: set[str] = set()
-    seen_hashes: set[str] = set()
-    target_org_id = connector.org_id
-
-    for i, row in enumerate(rows, start=1):
-        try:
-            translated = translate_payload(row, connector.field_mapping)
-            customer_id = translated.get("customer_id")
-            phone_number = translated.get("phone_number")
-            if not customer_id or not phone_number:
-                raise ValueError("customer_id and phone_number are required")
-            dedup_hash = compute_dedup_hash(target_org_id, customer_id, phone_number)
-        except ValueError as exc:
-            error_log.append({"row_number": i, "reason": str(exc)})
-            continue
-
-        if customer_id in seen_customer_ids:
-            error_log.append({"row_number": i, "reason": "Duplicate customer_id in file"})
-            continue
-
-        if dedup_hash in seen_hashes:
-            error_log.append({"row_number": i, "reason": "Duplicate found"})
-            continue
-
-        existing_hash = await leads_db.execute(
-            select(Leads).where(
-                Leads.org_id == target_org_id,
-                Leads.dedup_hash == dedup_hash,
-            )
+    try:
+        batch, success_rows, error_log = await complete_batch(
+            leads_db,
+            batch,
+            rows,
+            connector.org_id,
+            LeadSource.S3,
+            field_mapping=connector.field_mapping,
         )
-        if existing_hash.scalar_one_or_none():
-            error_log.append({"row_number": i, "reason": "Duplicate found"})
-            continue
-
-        existing_customer = await leads_db.execute(
-            select(Leads).where(
-                Leads.org_id == target_org_id,
-                Leads.customer_id == customer_id,
-            )
+    except TooManyLeads as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
         )
-        if existing_customer.scalar_one_or_none():
-            error_log.append({"row_number": i, "reason": "Duplicate customer_id"})
-            continue
 
-        lead = Leads(
-            org_id=target_org_id,
-            customer_id=customer_id,
-            phone_number=phone_number,
-            source=LeadSource.S3,
-            dedup_hash=dedup_hash,
-            lead_attributes={
-                key: value
-                for key, value in translated.items()
-                if key not in ("customer_id", "phone_number")
-            },
-            status=LeadStatus.PENDING,
-        )
-        leads_db.add(lead)
-        pending_leads.append((i, lead))
-        seen_customer_ids.add(customer_id)
-        seen_hashes.add(dedup_hash)
-
-        if len(pending_leads) >= BATCH_SIZE:
-            await flush_pending(leads_db, pending_leads, success_rows, error_log)
-            pending_leads = []
-
-    await flush_pending(leads_db, pending_leads, success_rows, error_log)
-
-    batch = await leads_db.get(LeadIngestionBatch, batch_id)
-    batch.total_leads = len(rows)
-    batch.success_leads = len(success_rows)
-    batch.failed_leads = len(error_log)
-    batch.error_messages = error_log
-    batch.completed_at = datetime.now(timezone.utc)
-    if error_log:
-        batch.status = LeadIngestionBatchStatus.COMPLETED_WITH_ERRORS
-    else:
-        batch.status = LeadIngestionBatchStatus.COMPLETED_SUCCESSFULLY
-
-    await leads_db.commit()
-    await leads_db.refresh(batch)
-
-    return {
-        "batch_id": str(batch.id),
-        "status": batch.status,
-        "target_org_id": target_org_id,
-        "object_key": body.object_key,
-        "bucket": connection_config["bucket"],
-        "resolved_key": full_key,
-        "total_rows_parsed": len(rows),
-        "total_rows_success": len(success_rows),
-        "total_rows_error": len(error_log),
-        "error_log": error_log,
-        "success_rows": success_rows,
-    }
+    return batch_summary(
+        batch,
+        rows,
+        success_rows,
+        error_log,
+        target_org_id=connector.org_id,
+        object_key=body.object_key,
+        bucket=connection_config["bucket"],
+        resolved_key=full_key,
+    )

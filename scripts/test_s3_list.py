@@ -10,8 +10,8 @@ from app.database_app import AsyncSessionLocal_app
 from app.models.clients import Clients
 from app.models.connector import Connector, ConnectorType
 import aioboto3
-
-from app.services.ingestion import R2_ENDPOINT_URL, list_pending_files
+from app.config import settings
+from app.services.s3_client import list_pending_files
 
 
 async def main():
@@ -44,7 +44,7 @@ async def main():
     session = aioboto3.Session()
     async with session.client(
         "s3",
-        endpoint_url=R2_ENDPOINT_URL,
+        endpoint_url=settings.s3_endpoint_url,
         aws_access_key_id=config["access_key"],
         aws_secret_access_key=config["secret_key"],
     ) as s3:

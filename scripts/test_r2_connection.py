@@ -1,20 +1,38 @@
 import asyncio
-import aioboto3
+import os
+import sys
+from pathlib import Path
 
-# R2 needs an account-specific endpoint URL, not AWS's default —
-# you'll need this from your Cloudflare dashboard
-R2_ENDPOINT_URL = "https://a12374b2a553b7aea70675086bfc3dc8.r2.cloudflarestorage.com"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+from app.config import settings
+from app.services.s3_client import get_s3_client
+
 
 async def main():
-    session = aioboto3.Session()
-    async with session.client(
-        "s3",
-        endpoint_url=R2_ENDPOINT_URL,
-        aws_access_key_id="820cbdbf07b129d7d5eef448b0836c2e",
-        aws_secret_access_key="31c532d1372866bda7a5f86ce01fdb2af4713e80b57be00f0227d7be96226230",
-    ) as s3:
-        response = await s3.list_objects_v2(Bucket="cr-platform-dev")
-        print(response.get("Contents", "Bucket is empty or no objects found"))
+    access_key = os.environ.get("TEST_CONNECTOR_S3_ACCESS_KEY_ID")
+    secret_key = os.environ.get("TEST_CONNECTOR_S3_SECRET_ACCESS_KEY")
+    bucket = os.environ.get("TEST_CONNECTOR_S3_BUCKET")
+    if not all([access_key, secret_key, bucket]):
+        print(
+            "Set TEST_CONNECTOR_S3_BUCKET, TEST_CONNECTOR_S3_ACCESS_KEY_ID, "
+            "and TEST_CONNECTOR_S3_SECRET_ACCESS_KEY in .env first."
+        )
+        return
+
+    async with get_s3_client(access_key, secret_key) as s3:
+        response = await s3.list_objects_v2(Bucket=bucket, MaxKeys=5)
+        contents = response.get("Contents") or []
+        print(f"endpoint={settings.s3_endpoint_url}")
+        print(f"bucket={bucket}")
+        print(f"count={len(contents)}")
+        for obj in contents:
+            print(obj["Key"])
+
 
 if __name__ == "__main__":
     asyncio.run(main())

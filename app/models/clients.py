@@ -1,7 +1,7 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import BigInteger, CheckConstraint, String, Enum, UniqueConstraint, func
+from sqlalchemy import BigInteger, CheckConstraint, String, Enum, func
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy import Identity

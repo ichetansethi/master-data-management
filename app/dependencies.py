@@ -1,3 +1,5 @@
+import hmac
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,6 +16,10 @@ from app.models.roles import Roles
 from app.database import AsyncSessionLocal
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
+
+def _credentials_match(stored: str, provided: str) -> bool:
+    return hmac.compare_digest(stored.encode("utf-8"), provided.encode("utf-8"))
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal_app() as session:
@@ -52,10 +58,16 @@ async def get_current_user(
 
     result = await db.execute(select(Users).where(Users.id == user_id))
     user = result.scalar_one_or_none()
-    if not user:
+    if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Inactive user",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -99,7 +111,9 @@ async def get_current_connector(
             detail="Connector not found or inactive",
         )
 
-    if connector.api_key != x_api_key or connector.api_secret != x_api_secret:
+    key_ok = _credentials_match(connector.api_key, x_api_key)
+    secret_ok = _credentials_match(connector.api_secret, x_api_secret)
+    if not (key_ok and secret_ok):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key or secret",
