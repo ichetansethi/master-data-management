@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int
 
     s3_endpoint_url: str
+    s3_poll_interval_seconds: int = 60
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

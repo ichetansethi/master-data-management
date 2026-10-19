@@ -10,7 +10,6 @@ from app.dependencies import require_role, get_db, get_leads_db
 from app.org_id import is_ten_digit_org_id
 from app.models.leads import LeadSource
 from app.services.ingestion import (
-    TooManyLeads,
     batch_summary,
     complete_batch,
     fail_batch,
@@ -85,19 +84,13 @@ async def upload_leads(
             detail="No data found in the uploaded file.",
         )
 
-    try:
-        batch, success_rows, error_log = await complete_batch(
-            leads_db,
-            batch,
-            rows,
-            target_org_id,
-            LeadSource.CSV,
-        )
-    except TooManyLeads as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        )
+    batch, success_rows, error_log = await complete_batch(
+        leads_db,
+        batch,
+        rows,
+        target_org_id,
+        LeadSource.CSV,
+    )
 
     return batch_summary(
         batch,

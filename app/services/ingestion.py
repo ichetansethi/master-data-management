@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.connector import Connector
 from app.models.lead_ingestion_batch import LeadIngestionBatch, LeadIngestionBatchStatus
 from app.models.leads import LeadSource, LeadStatus, Leads
 from app.utils.normalization import (
@@ -13,16 +14,29 @@ from app.utils.normalization import (
     normalize_phone_number,
     translate_payload,
 )
-MAX_LEADS = 100
+API_MAX_LEADS = 100
 COMMIT_BATCH_SIZE = 100
 
 
-class TooManyLeads(Exception):
-    """Raised after the batch is marked failed because the request exceeds MAX_LEADS."""
+def require_identity_mapping(connector: Connector) -> None:
+    """Reject a connector whose field_mapping does not cover both identity fields."""
+    mapped_targets = {
+        mapping.get("lead_attribute")
+        for mapping in (connector.field_mapping or [])
+    }
+    if "customer_id" not in mapped_targets or "phone_number" not in mapped_targets:
+        raise ValueError(
+            "Connector field_mapping must map both customer_id and phone_number."
+        )
 
-    def __init__(self, submitted: int):
+
+class TooManyLeads(Exception):
+    """Raised after the batch is marked failed because the request exceeds its cap."""
+
+    def __init__(self, submitted: int, max_leads: int):
         self.submitted = submitted
-        super().__init__(f"A single request can include at most {MAX_LEADS} leads.")
+        self.max_leads = max_leads
+        super().__init__(f"A single request can include at most {max_leads} leads.")
 
 def _lead_payload(lead: Leads) -> dict:
     return {
@@ -198,10 +212,14 @@ async def fail_batch(
     reason: str,
     *,
     total_leads: int = 0,
+    error_messages: list | None = None,
 ) -> None:
     batch.status = LeadIngestionBatchStatus.FAILED
     batch.total_leads = total_leads
-    batch.error_messages = [{"reason": reason}]
+    if error_messages is None:
+        batch.error_messages = [{"reason": reason}]
+    else:
+        batch.error_messages = [{"reason": reason}, *error_messages]
     batch.completed_at = datetime.now(timezone.utc)
     await leads_db.commit()
 
@@ -213,15 +231,16 @@ async def complete_batch(
     org_id: int,
     source: LeadSource,
     field_mapping: list[dict] | None = None,
+    max_leads: int | None = None,
 ) -> tuple[LeadIngestionBatch, list[dict], list[dict]]:
-    if len(rows) > MAX_LEADS:
+    if max_leads is not None and len(rows) > max_leads:
         await fail_batch(
             leads_db,
             batch,
-            f"A single request can include at most {MAX_LEADS} leads.",
+            f"A single request can include at most {max_leads} leads.",
             total_leads=len(rows),
         )
-        raise TooManyLeads(len(rows))
+        raise TooManyLeads(len(rows), max_leads)
 
     success_rows, error_log = await process_rows(
         leads_db,
@@ -231,9 +250,19 @@ async def complete_batch(
         field_mapping=field_mapping,
         batch_size=COMMIT_BATCH_SIZE,
     )
+    batch = await finalize_batch(leads_db, batch, len(rows), success_rows, error_log)
+    return batch, success_rows, error_log
 
+
+async def finalize_batch(
+    leads_db: AsyncSession,
+    batch: LeadIngestionBatch,
+    row_count: int,
+    success_rows: list[dict],
+    error_log: list[dict],
+) -> LeadIngestionBatch:
     batch = await leads_db.get(LeadIngestionBatch, batch.id)
-    batch.total_leads = len(rows)
+    batch.total_leads = row_count
     batch.success_leads = len(success_rows)
     batch.failed_leads = len(error_log)
     batch.error_messages = error_log
@@ -245,7 +274,7 @@ async def complete_batch(
 
     await leads_db.commit()
     await leads_db.refresh(batch)
-    return batch, success_rows, error_log
+    return batch
 
 
 def batch_summary(
