@@ -13,6 +13,8 @@ from app.security import decode_access_token
 from app.models.users import Users
 from app.models.connector import Connector
 from app.models.roles import Roles
+import app.clickhouse as clickhouse_db
+from clickhouse_connect.driver.asyncclient import AsyncClient
 from app.database import AsyncSessionLocal
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
@@ -28,6 +30,14 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def get_leads_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         yield session
+
+def get_clickhouse() -> AsyncClient:
+    if clickhouse_db.client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ClickHouse is not connected",
+        )
+    return clickhouse_db.client
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
